@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { QrCode, Loader2, Upload, X } from "lucide-react";
 import { toast } from "sonner";
 
@@ -20,6 +20,8 @@ import { Button } from "@/components/ui/button";
 export default function QRScannerModal({ isOpen, onClose }) {
   const scannerRef = useRef(null);
   const fileInputRef = useRef(null);
+  const isClosingRef = useRef(false);
+  const isScanningRef = useRef(false);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -29,52 +31,101 @@ export default function QRScannerModal({ isOpen, onClose }) {
   );
 
   // ===============================
+  // SAFELY close scanner
+  // ===============================
+  const safeClose = useCallback(async () => {
+    if (isClosingRef.current) return; // Prevent multiple close attempts
+    isClosingRef.current = true;
+
+    const scanner = scannerRef.current;
+    if (scanner && isScanningRef.current) {
+      try {
+        // Stop the scanner properly
+        await scanner.stop().catch((err) => {
+          // Ignore errors if scanner is already stopped
+          if (err && !err.message?.includes("already stopped")) {
+            console.warn("Error stopping scanner:", err);
+          }
+        });
+        
+        // Clear the scanner
+        await scanner.clear().catch((err) => {
+          // Ignore clear errors
+          console.warn("Error clearing scanner:", err);
+        });
+      } catch (err) {
+        console.warn("Error during scanner cleanup:", err);
+      }
+    }
+
+    scannerRef.current = null;
+    isScanningRef.current = false;
+    setLoading(false);
+    isClosingRef.current = false;
+    onClose();
+  }, [onClose]);
+
+  // ===============================
   // Handle QR result
   // ===============================
-  const handleResult = async (qrCode) => {
+  const handleResult = useCallback(async (qrCode) => {
+    if (isClosingRef.current) return; // Prevent handling result if already closing
+    
     try {
       await checkInAttendee({ qrCode });
       toast.success("✅ Check-in successful");
-      safeClose();
+      await safeClose();
     } catch {
       toast.error("Invalid or already used QR code");
     }
-  };
-
-  // ===============================
-  // SAFELY close scanner
-  // ===============================
-  const safeClose = () => {
-    if (scannerRef.current) {
-      scannerRef.current.stop().catch(() => {});
-      scannerRef.current.clear().catch(() => {});
-      scannerRef.current = null;
-    }
-    onClose();
-  };
+  }, [checkInAttendee, safeClose]);
 
   // ===============================
   // Start CAMERA scanner
   // ===============================
   useEffect(() => {
-    if (!isOpen) return;
-    if (scannerRef.current) return; //  prevent double start
+    if (!isOpen) {
+      // Clean up when modal is closed
+      if (scannerRef.current && isScanningRef.current) {
+        const cleanup = async () => {
+          isClosingRef.current = true;
+          const scanner = scannerRef.current;
+          if (scanner) {
+            try {
+              await scanner.stop().catch(() => {});
+              await scanner.clear().catch(() => {});
+            } catch (err) {
+              // Ignore cleanup errors
+            }
+          }
+          scannerRef.current = null;
+          isScanningRef.current = false;
+          isClosingRef.current = false;
+        };
+        cleanup();
+      }
+      return;
+    }
+
+    if (scannerRef.current || isScanningRef.current) return; // prevent double start
 
     let cancelled = false;
+    isClosingRef.current = false;
 
     const startCamera = async () => {
       try {
         setLoading(true);
         setError(null);
 
-        //  wait for Dialog DOM
+        // wait for Dialog DOM
         await new Promise((r) => setTimeout(r, 500));
-        if (cancelled) return;
+        if (cancelled || isClosingRef.current) return;
 
         const { Html5Qrcode } = await import("html5-qrcode");
 
         const scanner = new Html5Qrcode("qr-reader");
         scannerRef.current = scanner;
+        isScanningRef.current = true;
 
         await scanner.start(
           { facingMode: "environment" },
@@ -86,17 +137,37 @@ export default function QRScannerModal({ isOpen, onClose }) {
             showZoomSliderIfSupported: false,
           },
           async (decodedText) => {
-            await scanner.stop();
-            scannerRef.current = null;
+            // Prevent callback from executing if we're already closing
+            if (isClosingRef.current || cancelled) return;
+
+            const currentScanner = scannerRef.current;
+            if (currentScanner && isScanningRef.current) {
+              try {
+                await currentScanner.stop();
+                scannerRef.current = null;
+                isScanningRef.current = false;
+              } catch (err) {
+                // Scanner might already be stopped, ignore error
+                scannerRef.current = null;
+                isScanningRef.current = false;
+              }
+            }
+            
             handleResult(decodedText);
           }
         );
 
         setLoading(false);
       } catch (err) {
+        // Check if error is due to cancellation
+        if (cancelled || isClosingRef.current) {
+          return;
+        }
         console.error(err);
         setError("Camera stopped. Please close and reopen scanner.");
         setLoading(false);
+        scannerRef.current = null;
+        isScanningRef.current = false;
       }
     };
 
@@ -104,13 +175,19 @@ export default function QRScannerModal({ isOpen, onClose }) {
 
     return () => {
       cancelled = true;
-      if (scannerRef.current) {
-        scannerRef.current.stop().catch(() => {});
-        scannerRef.current.clear().catch(() => {});
+      isClosingRef.current = true;
+      
+      const scanner = scannerRef.current;
+      if (scanner && isScanningRef.current) {
+        // Stop scanner synchronously in cleanup
+        scanner.stop().catch(() => {}).finally(() => {
+          scanner.clear().catch(() => {});
+        });
         scannerRef.current = null;
+        isScanningRef.current = false;
       }
     };
-  }, [isOpen]);
+  }, [isOpen, handleResult]);
 
   // ===============================
   // Scan from IMAGE
@@ -134,7 +211,14 @@ export default function QRScannerModal({ isOpen, onClose }) {
   };
 
   return (
-    <Dialog open={isOpen} onOpenChange={safeClose}>
+    <Dialog 
+      open={isOpen} 
+      onOpenChange={(open) => {
+        if (!open) {
+          safeClose();
+        }
+      }}
+    >
       <DialogContent forceMount className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
